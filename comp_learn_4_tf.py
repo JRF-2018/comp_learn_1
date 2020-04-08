@@ -1,0 +1,227 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+__version__ = '0.0.4' # Time-stamp: <2019-05-15T20:16:24Z>
+
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import argparse
+
+input_size = 2
+output_size = 2
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--max-epoch", default=300, dest="max_epoch", type=int)
+parser.add_argument("--max-iters", default=100, dest="max_iters", type=int)
+parser.add_argument("--batch-size", default=10, dest="batch_size", type=int)
+parser.add_argument("--hidden-size", default=7, dest="hidden_size", type=int)
+parser.add_argument("--learning-rate", default=0.1, dest="learning_rate", type=float)
+parser.add_argument("--negative-learning-rate", default=0.1, dest="negative_learning_rate", type=float)
+#parser.add_argument("--affine-init", default="0.5", dest="affine_init", choices=["standard", "0.5", "arange"])
+parser.add_argument("--affine-init", default="0.5", dest="affine_init")
+parser.add_argument("--use-sigmoid", default=False, dest="use_sigmoid", action="store_true")
+parser.add_argument("--use-random-competitor", default=False, dest="use_random_competitor", action="store_true")
+
+parser.add_argument("--neg-coeff", default=-1.0, dest="neg_coeff", type=float)
+parser.add_argument("--neg-sigma", default=1.0, dest="neg_sigma", type=float)
+parser.add_argument("--neg-mid", default=0.5, dest="neg_mid", type=float)
+parser.add_argument("--neg-bs-first", default=0.1, dest="neg_bs_first", type=float)
+parser.add_argument("--neg-bs-mid", default=0.01, dest="neg_bs_mid", type=float)
+parser.add_argument("--neg-bs-last", default=0.0, dest="neg_bs_last", type=float)
+
+args = parser.parse_args()
+max_epoch = args.max_epoch
+max_iters = args.max_iters
+batch_size = args.batch_size
+hidden_size = args.hidden_size
+learning_rate = args.learning_rate
+negative_learning_rate = args.negative_learning_rate
+#affine_init = args.affine_init
+use_sigmoid = args.use_sigmoid
+use_random_competitor = args.use_random_competitor
+affine_inits = args.affine_init.split(",")
+if len(affine_inits) < 2:
+    affine_inits.append(affine_inits[0])
+for s in affine_inits:
+    if s not in ["standard", "0.5", "arange", "arange2"]:
+        parser.error("--affine-init takes a comma-separated list of {standard,0.5,arange,arange2}.")
+
+neg_coeff = args.neg_coeff
+neg_sigma = args.neg_sigma
+neg_mid = args.neg_mid
+neg_bs_first = args.neg_bs_first
+neg_bs_mid = args.neg_bs_mid
+neg_bs_last = args.neg_bs_last
+
+## Aurélien Géron『scikit-learnとTensorFlowによる実践機械学習』(下田
+## 倫大 監訳, 長尾高弘 訳)を参考にしている。
+
+X = tf.placeholder(tf.float32, shape=(None, input_size), name="X")
+y = tf.placeholder(tf.float32, shape=(None), name="y")
+epoch_v = tf.placeholder(tf.float32, name="epoch_v")
+
+def neuron_layer(X, n_neurons, name, activation=None, affine_init="0.5"):
+    with tf.name_scope(name):
+        n_inputs = int(X.get_shape()[1])
+        stddev = 2 / np.sqrt(n_inputs * n_neurons)
+        if affine_init == "0.5":
+            init = 0.5 * tf.random_normal((n_inputs, n_neurons))
+            W = tf.Variable(init, name="kernel")
+            b = tf.Variable(tf.zeros([n_neurons]), name="bias")
+        elif affine_init == "arange":
+            W = tf.Variable(arange_matrix((n_inputs, n_neurons)), name="kernel")
+            b = tf.Variable(arange_matrix((n_neurons,)), name="bias")
+        elif affine_init == "arange2":
+            W = tf.Variable(-arange_matrix((n_inputs, n_neurons)), name="kernel")
+            b = tf.Variable(-arange_matrix((n_neurons,)), name="bias")
+        else:
+            # init = tf.truncated_normal((n_inputs, n_neurons), stddev=stddev)
+            init = 0.01 * tf.random_normal((n_inputs, n_neurons))
+            W = tf.Variable(init, name="kernel")
+            b = tf.Variable(tf.zeros([n_neurons]), name="bias")
+
+        Z = tf.matmul(X, W) + b
+        if activation is not None:
+            return activation(Z)
+        else:
+            return Z
+
+def arange_matrix_tf (shape):
+    n = tf.reduce_prod(shape)
+    return tf.cast((tf.reshape(tf.range(n), shape) / n) - 0.5, tf.float32)
+
+def arange_matrix (shape):
+    n = np.prod(shape)
+    return ((np.arange(n).reshape(shape) / n) - 0.5).astype(np.float32)
+
+def answer_of_input(I):
+    x0 = I[:,0]
+    x1 = I[:,1]
+    y0 = x0 ** 2 + x1 ** 2
+    y1 = 2 * x0 * x1
+    return tf.stack([y0, y1], axis=1)
+
+def bsphere_rand(shape):
+    r = tf.random.normal(shape)
+    n = tf.norm(r, axis=1, keepdims=True)
+    return r / n
+
+activation = tf.nn.sigmoid if use_sigmoid else tf.nn.relu
+with tf.name_scope("dnn1"):
+    hidden1 = neuron_layer(X, hidden_size, "hidden1",
+                           activation=activation, affine_init=affine_inits[0])
+    hidden2 = neuron_layer(hidden1, hidden_size, "hidden2",
+                           activation=activation, affine_init=affine_inits[0])
+    outputs1 = neuron_layer(hidden2, output_size, "outputs",
+                            affine_init=affine_inits[0])
+
+with tf.name_scope("dnn2"):
+    hidden1 = neuron_layer(X, hidden_size, "hidden1",
+                           activation=activation, affine_init=affine_inits[1])
+    hidden2 = neuron_layer(hidden1, hidden_size, "hidden2",
+                           activation=activation, affine_init=affine_inits[1])
+    outputs2 = neuron_layer(hidden2, output_size, "outputs",
+                            affine_init=affine_inits[1])
+
+# with tf.name_scope("dnn1"):
+#     hidden1 = tf.layers.dense(X, hidden_size, "hidden1",
+#                               activation=activation)
+#     hidden2 = tf.layers.dense(hidden1, hidden_size, "hidden2",
+#                               activation=activation)
+#     outputs1 = tf.layers.dense(hidden2, output_size, "outputs1")
+# 
+# with tf.name_scope("dnn2"):
+#     hidden1 = tf.layers.dense(X, hidden_size, "hidden1",
+#                               activation=activation)
+#     hidden2 = tf.layers.dense(hidden1, hidden_size, "hidden2",
+#                               activation=activation)
+#     outputs2 = tf.layers.dense(hidden2, output_size, "outputs2")
+
+with tf.name_scope("loss1"):
+    loss1 = tf.losses.mean_squared_error(labels=y, predictions=outputs1)
+with tf.name_scope("loss2"):
+    loss2 = tf.losses.mean_squared_error(labels=y, predictions=outputs2)
+
+d = tf.reduce_sum(tf.square(outputs1 - y), axis=1) \
+    < tf.reduce_sum(tf.square(outputs2 - y), axis=1)
+if use_random_competitor:
+    outputs3 = tf.random_uniform(tf.shape(outputs1), -2.0, 2.0)
+    d1 = tf.reduce_sum(tf.square(outputs1 - y), axis=1)
+    d2 = tf.reduce_sum(tf.square(outputs2 - y), axis=1)
+    d3 = tf.reduce_sum(tf.square(outputs3 - y), axis=1)
+    amin = tf.argmin(tf.stack([d1, d2, d3], axis=1), axis=1)
+    ps = [outputs1, outputs2, outputs3]
+    y1 = tf.stop_gradient(tf.map_fn(lambda i: tf.gather(tf.gather(ps, tf.gather(amin, i)), i), tf.range(tf.shape(amin)[0]), dtype=tf.float32))
+else:
+    y1 = tf.stop_gradient(tf.where(d, outputs1, outputs2))
+
+bs = tf.cond(epoch_v < max_epoch / 2,
+             lambda: neg_bs_first + (neg_bs_mid - neg_bs_first) * epoch_v / (max_epoch / 2),
+             lambda: neg_bs_mid + (neg_bs_last - neg_bs_mid) * (epoch_v - max_epoch / 2) / (max_epoch / 2))
+bs = bs * bsphere_rand(tf.shape(outputs1))
+pnd = neg_mid * (outputs1 - outputs2) + neg_coeff * (outputs1 - outputs2) * tf.exp(- tf.reduce_sum(tf.square(outputs1 - outputs2), axis=1, keepdims=True) / (2 * neg_sigma **2)) + bs
+pn1 = pnd + outputs2
+pn2 = - pnd + outputs1
+y2_1 = tf.stop_gradient(tf.where(~d, outputs1, pn2))
+y2_2 = tf.stop_gradient(tf.where(~d, pn1, outputs2))
+with tf.name_scope("ploss1"):
+    ploss1 = tf.losses.mean_squared_error(labels=y1, predictions=outputs1)
+with tf.name_scope("ploss2"):
+    ploss2 = tf.losses.mean_squared_error(labels=y1, predictions=outputs2)
+with tf.name_scope("nloss1"):
+    nloss1 = tf.losses.mean_squared_error(labels=y2_1, predictions=outputs1)
+with tf.name_scope("nloss2"):
+    nloss2 = tf.losses.mean_squared_error(labels=y2_2, predictions=outputs2)
+
+optimizer = tf.train.GradientDescentOptimizer(learning_rate=learning_rate)
+noptimizer = tf.train.GradientDescentOptimizer(learning_rate=negative_learning_rate)
+training_op1 = optimizer.minimize(ploss1)
+training_op2 = optimizer.minimize(ploss2)
+ntraining_op1 = noptimizer.minimize(nloss1)
+ntraining_op2 = noptimizer.minimize(nloss2)
+
+answer = answer_of_input(X)
+
+init = tf.global_variables_initializer()
+
+total_loss1 = 0
+total_loss2 = 0
+loss_count = 0
+loss_list1 = []
+loss_list2 = []
+
+with tf.Session() as sess:
+    init.run()
+
+    for epoch in range(max_epoch):
+        for iters in range(max_iters):
+            X_val = np.random.uniform(-1.0, 1.0, (batch_size, input_size))
+            y_val = sess.run(answer, feed_dict={X: X_val})
+            loss1_val, loss2_val, _, _, _, _ \
+                = sess.run((loss1, loss2, training_op1, training_op2,
+                            ntraining_op1, ntraining_op2),
+                           feed_dict={X: X_val, y: y_val, epoch_v: epoch})
+
+            total_loss1 += loss1_val
+            total_loss2 += loss2_val
+            loss_count += 1
+
+            if (iters + 1) % 10 == 0:
+                avg_loss1 = total_loss1 / loss_count
+                avg_loss2 = total_loss2 / loss_count
+                print('| epoch %d | iter %d / %d | loss %.2f, %.2f'
+                      % (epoch + 1, iters + 1, max_iters, avg_loss1, avg_loss2))
+                loss_list1.append(avg_loss1)
+                loss_list2.append(avg_loss2)
+                total_loss1, total_loss2, loss_count = 0, 0, 0
+
+ylim = None
+x = np.arange(len(loss_list1))
+if ylim is not None:
+    plt.ylim(*ylim)
+plt.plot(x, loss_list1, label='train1')
+plt.plot(x, loss_list2, label='train2')
+plt.xlabel('iterations (x' + str(10) + ')')
+plt.ylabel('loss')
+#plt.legend()
+plt.show()
